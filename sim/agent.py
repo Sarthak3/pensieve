@@ -10,8 +10,8 @@ import env
 import a3c
 import load_trace
 
+S_INFO = 8  # bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
 
-S_INFO = 6  # bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
 S_LEN = 8  # take how many frames in the past
 A_DIM = 6
 ACTOR_LR_RATE = 0.0001
@@ -34,6 +34,32 @@ LOG_FILE = './results/log'
 NN_MODEL = None
 
 
+def decision_tree(loc_last_stall,delay,num_stall,tst):
+    rel_loc_stall = loc_last_stall
+    delay = delay / M_IN_K
+    rel_tst = tst / M_IN_K
+    if(rel_loc_stall > 55):
+        if(delay < 5):
+            if(rel_tst < 2):
+                return 4.9
+            else:
+                return 4.45
+        else:
+            return 4.05
+    else:
+        if(num_stall < 4):
+            if(rel_tst < 4):
+                if(num_stall < 2):
+                    return 3.65
+                else:
+                    return 3.3
+            else:
+                if(rel_tst < 7):
+                    return 3.5
+                else:
+                    return 2.5
+        else:
+            return 1.4
 def main():
 
     np.random.seed(RANDOM_SEED)
@@ -87,7 +113,25 @@ def main():
         actor_gradient_batch = []
         critic_gradient_batch = []
 
-        while True:  # serve video forever
+        num_stall = 0
+        tst = 0
+        loc_last_stall = 0
+        STALL_THRES = 4.05
+        CONV_TIME = 1200 / (120*M_IN_K*M_IN_K)
+        
+        ALPHA = 0.8
+        thrp = 0
+        dtime = 0
+
+        avg_bitrate = 0
+        avg_rebuffer = 0
+        avg_smooth = 0
+        stalls = []
+        avg_qoe = 0
+        tot_data = 0
+
+        epochs = set()
+        while epoch<100:  # serve video forever
             # the action is from the last decision
             # this is to make the framework similar to the real
             delay, sleep_time, buffer_size, rebuf, \
@@ -99,12 +143,42 @@ def main():
             time_stamp += sleep_time  # in ms
 
             # reward is video quality - rebuffer penalty - smooth penalty
+            
+            avg_bitrate += (VIDEO_BIT_RATE[bit_rate] / M_IN_K)
+            avg_rebuffer += (REBUF_PENALTY * rebuf)
+            avg_smooth += (SMOOTH_PENALTY * np.abs(VIDEO_BIT_RATE[bit_rate] - VIDEO_BIT_RATE[last_bit_rate]) / M_IN_K) 
+
             reward = VIDEO_BIT_RATE[bit_rate] / M_IN_K \
                      - REBUF_PENALTY * rebuf \
                      - SMOOTH_PENALTY * np.abs(VIDEO_BIT_RATE[bit_rate] -
                                                VIDEO_BIT_RATE[last_bit_rate]) / M_IN_K
-            r_batch.append(reward)
 
+            avg_qoe += reward
+            tot_data = tot_data + 1
+
+            chunk_time = video_chunk_size * CONV_TIME
+
+            if buffer_size < STALL_THRES:
+                num_stall = num_stall + 1
+                tst += chunk_time
+                loc_last_stall = 0
+                stalls.append(1)
+            else:
+                loc_last_stall += chunk_time
+                stalls.append(0)
+
+            if(num_stall > 10):
+                num_stall = 0
+            if(tst > 14000):
+                tst = 0
+
+            mos = decision_tree(loc_last_stall,delay,num_stall,tst)
+            reward += mos
+
+            r_batch.append(reward)
+           
+
+            
             last_bit_rate = bit_rate
 
             # retrieve previous state
@@ -116,13 +190,21 @@ def main():
             # dequeue history record
             state = np.roll(state, -1, axis=1)
 
+            cthrp = float(video_chunk_size) / float(delay) / M_IN_K  # kilo byte / ms
+            thrp = (1.0 - ALPHA) * thrp + ALPHA * cthrp
+
+            cdtime  = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec
+            dtime = (1.0 - ALPHA) * dtime + ALPHA * cdtime 
+
             # this should be S_INFO number of terms
             state[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))  # last quality
             state[1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 10 sec
-            state[2, -1] = float(video_chunk_size) / float(delay) / M_IN_K  # kilo byte / ms
-            state[3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec 
+            state[2, -1] = thrp
+            state[3, -1] = dtime
             state[4, :A_DIM] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K  # mega byte
             state[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
+            state[6, -1] = loc_last_stall
+            state[7,-1] = tst
 
             action_prob = actor.predict(np.reshape(state, (1, S_INFO, S_LEN)))
             action_cumsum = np.cumsum(action_prob)
@@ -154,10 +236,9 @@ def main():
                 actor_gradient_batch.append(actor_gradient)
                 critic_gradient_batch.append(critic_gradient)
 
-                print "===="
-                print "Epoch", epoch
-                print "TD_loss", td_loss, "Avg_reward", np.mean(r_batch), "Avg_entropy", np.mean(entropy_record)
-                print "===="
+                if(epoch not in epochs):
+                    print "Epoch", epoch, " Bitrate ",VIDEO_BIT_RATE[bit_rate], " Avg_reward", np.mean(r_batch)
+                    epochs.add(epoch)
 
                 summary_str = sess.run(summary_ops, feed_dict={
                     summary_vars[0]: td_loss,
@@ -173,16 +254,7 @@ def main():
                 if len(actor_gradient_batch) >= GRADIENT_BATCH_SIZE:
 
                     assert len(actor_gradient_batch) == len(critic_gradient_batch)
-                    # assembled_actor_gradient = actor_gradient_batch[0]
-                    # assembled_critic_gradient = critic_gradient_batch[0]
-                    # assert len(actor_gradient_batch) == len(critic_gradient_batch)
-                    # for i in xrange(len(actor_gradient_batch) - 1):
-                    #     for j in xrange(len(actor_gradient)):
-                    #         assembled_actor_gradient[j] += actor_gradient_batch[i][j]
-                    #         assembled_critic_gradient[j] += critic_gradient_batch[i][j]
-                    # actor.apply_gradients(assembled_actor_gradient)
-                    # critic.apply_gradients(assembled_critic_gradient)
-
+                  
                     for i in xrange(len(actor_gradient_batch)):
                         actor.apply_gradients(actor_gradient_batch[i])
                         critic.apply_gradients(critic_gradient_batch[i])
@@ -217,6 +289,19 @@ def main():
                 action_vec = np.zeros(A_DIM)
                 action_vec[bit_rate] = 1
                 a_batch.append(action_vec)
+
+        avg_bitrate /= tot_data
+        avg_rebuffer /= tot_data
+        avg_smooth /= tot_data
+        avg_stall = np.mean(stalls)
+        avg_qoe /= tot_data
+
+        print "Avg bitrate: ",avg_bitrate
+        print "avg_rebuffer: ",avg_rebuffer
+        print "avg_smooth: ",avg_smooth
+        print "avg_stall: ",avg_stall
+        print "avg_qoe: ",avg_qoe
+
 
 if __name__ == '__main__':
     main()
