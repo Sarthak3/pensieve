@@ -1,4 +1,14 @@
 # Pensieve
+
+We worked on the pensieve ABR algorithm. We made some changes to
+the existing model to calculate QoE in a better way and use QoE related
+features in the input feature set.
+As we suggested in the literature review, the model can take QoE feedback
+from the client side and add it to the input feature set. For instance, if the
+feedback says poor video quality, bit rate can be increased.
+
+ Changes were made in sim/a3c.py and sim/agent.py
+
 Pensieve is a system that generates adaptive bitrate algorithms using reinforcement learning.
 http://web.mit.edu/pensieve/
 
